@@ -199,7 +199,7 @@ async def _scan_aluno_id(session: aiohttp.ClientSession, aid: int, ids_ig: set, 
             await aluno_queue.put(aluno)
 
     st['p'] += 1
-    if st['p'] % 5_000 == 0:
+    if st['p'] % 500 == 0:
         pct = st['p'] / st['t'] * 100
         elapsed = time.time() - st['t0']
         rps = st['p'] / elapsed if elapsed else 0
@@ -309,7 +309,7 @@ async def _worker_historico(session: aiohttp.ClientSession, aluno_queue: asyncio
 
         aluno_queue.task_done()
         st['p'] += 1
-        if st['p'] % 50 == 0:
+        if st['p'] % 10 == 0:
             log(f"Histórico: {st['p']:,}/{st['t']:,} | AIMD: {limiter.limit}")
 
 async def run_pipeline_alunos(session: aiohttp.ClientSession, ids: list[int], ids_ig: set, out_alunos: list, out_hist: dict, limiter: AIRateLimiter):
@@ -413,7 +413,7 @@ async def _coletar_aula(session: aiohttp.ClientSession, auid: int, inst_set: set
 
     out_au.append(d)
     st['p'] += 1
-    if st['p'] % 1_000 == 0:
+    if st['p'] % 100 == 0:
         log(f"Aulas: {st['p']:,}/{st['t']:,} | HTL: {len(out_au)} | AIMD: {limiter.limit}")
 
 async def run_scan_aulas(session: aiohttp.ClientSession, ids: list[int], inst_set: set, out_aulas: list, relacao_aul: dict, limiter: AIRateLimiter):
@@ -472,7 +472,7 @@ async def _scan_turma_id(session: aiohttp.ClientSession, tid: int, inst_set: set
         await turma_queue.put(tid)
 
     st['p'] += 1
-    if st['p'] % 2_000 == 0:
+    if st['p'] % 100 == 0:
         log(f"Turmas: {st['p']:,}/{st['t']:,} | HTL: {len(out_tu)} | AIMD: {limiter.limit}")
 
 async def _worker_matriculas(session: aiohttp.ClientSession, turma_queue: asyncio.Queue, out_mat: list, limiter: AIRateLimiter):
