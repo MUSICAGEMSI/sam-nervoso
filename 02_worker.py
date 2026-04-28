@@ -16,11 +16,12 @@ MAT_WORKERS      = 15
 MAT_QUEUE_SIZE   = 80
 SCAN_CHUNK       = 500
 
+# ── AIMD Configurado para "Velocidade de Cruzeiro" ──
 AIMD_START    = 100
 AIMD_FLOOR    = 30
-AIMD_CEILING  = 300
+AIMD_CEILING  = 150   # Teto seguro para não acionar a "caixa de pênalti" do WAF
 AIMD_AI_AFTER = 5
-AIMD_MD_FATOR = 0.5
+AIMD_MD_FATOR = 0.8
 
 TIMEOUT_PADRAO = aiohttp.ClientTimeout(total=4, connect=2)
 
@@ -576,11 +577,30 @@ async def main():
     async with aiohttp.ClientSession(connector=conn, headers=base_headers, cookie_jar=jar) as sess:
         log("🚀 Lançando SEQ1 ∥ SEQ2 em paralelo total...")
 
+        # ── Worker Fantasma de Auto-Save ──
+        async def auto_save():
+            while True:
+                await asyncio.sleep(300) # Salva a cada 5 minutos
+                log("💾 [AUTO-SAVE] Gravando backup de segurança no disco...")
+                backup = {
+                    "seq1": {"alunos": out_alunos, "historicos": out_hist},
+                    "seq2": {"aulas": out_aulas, "turmas": out_turmas, "matriculas": out_mat}
+                }
+                try:
+                    with open('backup_emergencia.json', 'w', encoding='utf-8') as f:
+                        json.dump(backup, f, ensure_ascii=False)
+                except Exception as e:
+                    log(f"⚠️ Erro ao salvar backup: {e}")
+
+        tarefa_backup = asyncio.create_task(auto_save())
+
         await asyncio.gather(
             run_pipeline_alunos(sess, ids_al, ids_ig, out_alunos, out_hist, limiter),
             run_scan_aulas(sess, ids_au, insts, out_aulas, relacao_aul, limiter),
             run_pipeline_turmas(sess, ids_tu, insts, out_turmas, out_mat, limiter),
         )
+
+        tarefa_backup.cancel()
 
     log(f"AIMD final: limit={limiter.limit} (começou em {AIMD_START})")
 
