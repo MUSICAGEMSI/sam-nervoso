@@ -1,28 +1,34 @@
 from dotenv import load_dotenv
 load_dotenv(dotenv_path="credencial.env")
 
-import os, json, asyncio, aiohttp, re, unicodedata, time
+import os
+import json
+import asyncio
+import aiohttp
+import re
+import unicodedata
+import time
 from contextlib import asynccontextmanager
 from bs4 import BeautifulSoup
 from lxml import html as lxh
 from datetime import datetime
 
-LOTE_ATUAL  = int(os.environ.get('LOTE_ATUAL',  1))
+LOTE_ATUAL = int(os.environ.get('LOTE_ATUAL', 1))
 TOTAL_LOTES = int(os.environ.get('TOTAL_LOTES', 1))
 
-HIST_WORKERS     = 30
-HIST_QUEUE_SIZE  = 300
-MAT_WORKERS      = 15
-MAT_QUEUE_SIZE   = 80
-SCAN_CHUNK       = 500
+HIST_WORKERS = 30
+HIST_QUEUE_SIZE = 300
+MAT_WORKERS = 15
+MAT_QUEUE_SIZE = 80
+SCAN_CHUNK = 500
 
-AIMD_START    = 30
-AIMD_FLOOR    = 15
-AIMD_CEILING  = 100
-AIMD_AI_AFTER = 5
-AIMD_MD_FATOR = 0.8
+AIMD_START = 20
+AIMD_FLOOR = 10
+AIMD_CEILING = 80
+AIMD_AI_AFTER = 50
+AIMD_MD_FATOR = 0.5
 
-TIMEOUT_PADRAO = aiohttp.ClientTimeout(total=4, connect=2)
+TIMEOUT_PADRAO = aiohttp.ClientTimeout(total=3, connect=1.5)
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [W{LOTE_ATUAL:02d}/{TOTAL_LOTES}] {msg}", flush=True)
@@ -67,14 +73,14 @@ def chunks(lst, n):
 
 class AIRateLimiter:
     def __init__(self, start=AIMD_START, floor=AIMD_FLOOR, ceiling=AIMD_CEILING, ai_after=AIMD_AI_AFTER, md=AIMD_MD_FATOR):
-        self._limit   = start
-        self._floor   = floor
+        self._limit = start
+        self._floor = floor
         self._ceiling = ceiling
         self._ai_after = ai_after
-        self._md      = md
-        self._active  = 0
-        self._streak  = 0
-        self._cond    = asyncio.Condition()
+        self._md = md
+        self._active = 0
+        self._streak = 0
+        self._cond = asyncio.Condition()
 
     @property
     def limit(self): return self._limit
@@ -162,11 +168,11 @@ def _extrair_aluno_lxml(html_str: str, aid: int, ids_ig: set) -> dict | None:
         return (vals[0] if vals else '').strip()
 
     d = {
-        'id_aluno':  aid,
+        'id_aluno': aid,
         'id_igreja': igi,
-        'nome':      inp_val('nome'),
-        'fl_tipo':   inp_val('fl_tipo'),
-        'status':    inp_val('status'),
+        'nome': inp_val('nome'),
+        'fl_tipo': inp_val('fl_tipo'),
+        'status': inp_val('status'),
     }
     for campo in ('cargo', 'nivel', 'instrumento', 'tonalidade'):
         d[f'id_{campo}'], d[f'{campo}_nome'] = sel_val(campo)
@@ -199,7 +205,7 @@ async def _scan_aluno_id(session: aiohttp.ClientSession, aid: int, ids_ig: set, 
             await aluno_queue.put(aluno)
 
     st['p'] += 1
-    if st['p'] % 500 == 0:
+    if st['p'] % 100 == 0:
         pct = st['p'] / st['t'] * 100
         elapsed = time.time() - st['t0']
         rps = st['p'] / elapsed if elapsed else 0
@@ -413,7 +419,7 @@ async def _coletar_aula(session: aiohttp.ClientSession, auid: int, inst_set: set
 
     out_au.append(d)
     st['p'] += 1
-    if st['p'] % 100 == 0:
+    if st['p'] % 50 == 0:
         log(f"Aulas: {st['p']:,}/{st['t']:,} | HTL: {len(out_au)} | AIMD: {limiter.limit}")
 
 async def run_scan_aulas(session: aiohttp.ClientSession, ids: list[int], inst_set: set, out_aulas: list, relacao_aul: dict, limiter: AIRateLimiter):
@@ -491,11 +497,11 @@ async def _worker_matriculas(session: aiohttp.ClientSession, turma_queue: asynci
                     tds = rw.find_all('td')
                     if len(tds) >= 4 and 'Nenhum' not in tds[0].text:
                         out_mat.append({
-                            'ID_Turma':    tid,
-                            'Nome':        tds[0].text.strip(),
-                            'Comum':       tds[1].text.strip(),
+                            'ID_Turma': tid,
+                            'Nome': tds[0].text.strip(),
+                            'Comum': tds[1].text.strip(),
                             'Instrumento': tds[2].text.strip(),
-                            'Status':      tds[3].text.strip(),
+                            'Status': tds[3].text.strip(),
                         })
         turma_queue.task_done()
 
@@ -525,9 +531,9 @@ async def main():
         if not os.path.exists(arq):
             log(f"❌ Arquivo obrigatório não encontrado: {arq}"); return
 
-    with open('config_ranges.json',    'r') as f: cfg   = json.load(f)
-    with open('session_cookies.json',  'r') as f: ck    = json.load(f)
-    with open('seq1_localidades.json', 'r', encoding='utf-8') as f: locs  = json.load(f)
+    with open('config_ranges.json', 'r') as f: cfg = json.load(f)
+    with open('session_cookies.json', 'r') as f: ck = json.load(f)
+    with open('seq1_localidades.json', 'r', encoding='utf-8') as f: locs = json.load(f)
     with open('seq2_instrutores.json', 'r', encoding='utf-8') as f: insts = set(json.load(f))
 
     ids_ig = set(l['id_igreja'] for l in locs)
@@ -538,20 +544,20 @@ async def main():
 
     ia, fa = fatia(cfg, 'alunos')
     iau, fau = fatia(cfg, 'aulas')
-    it, ft   = fatia(cfg, 'turmas')
+    it, ft = fatia(cfg, 'turmas')
 
-    ids_al = list(range(ia,  fa  + 1))
+    ids_al = list(range(ia, fa + 1))
     ids_au = list(range(iau, fau + 1))
-    ids_tu = list(range(it,  ft  + 1))
+    ids_tu = list(range(it, ft + 1))
 
     log(f"Fatias — Alunos: {ia:,}→{fa:,} ({len(ids_al):,}) | Aulas: {iau:,}→{fau:,} ({len(ids_au):,}) | Turmas: {it:,}→{ft:,} ({len(ids_tu):,})")
 
-    out_alunos  = []
-    out_hist    = {k: [] for k in ['mts_individual','mts_grupo','msa_individual','msa_grupo','provas','hinario_individual','hinario_grupo','metodos','escalas_individual','escalas_grupo']}
-    out_aulas   = []
+    out_alunos = []
+    out_hist = {k: [] for k in ['mts_individual','mts_grupo','msa_individual','msa_grupo','provas','hinario_individual','hinario_grupo','metodos','escalas_individual','escalas_grupo']}
+    out_aulas = []
     relacao_aul = {}
-    out_turmas  = []
-    out_mat     = []
+    out_turmas = []
+    out_mat = []
 
     limiter = AIRateLimiter()
     log(f"⚙️  AIMD: start={AIMD_START} | floor={AIMD_FLOOR} | ceiling={AIMD_CEILING} | ai_after={AIMD_AI_AFTER}")
@@ -605,14 +611,14 @@ async def main():
     resultado = {
         "lote": LOTE_ATUAL,
         "seq1": {
-            "alunos":    out_alunos,
+            "alunos": out_alunos,
             "historicos": out_hist,
         },
         "seq2": {
-            "aulas":         out_aulas,
+            "aulas": out_aulas,
             "relacao_aulas": relacao_aul,
-            "turmas":        out_turmas,
-            "matriculas":    out_mat,
+            "turmas": out_turmas,
+            "matriculas": out_mat,
         },
     }
     arq_saida = f"output_lote_{LOTE_ATUAL}.json"
