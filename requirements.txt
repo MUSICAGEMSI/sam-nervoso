@@ -6,3 +6,5 @@ aiohttp
 lxml
 yarl
 brotli
+httpx
+
