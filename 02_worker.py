@@ -22,7 +22,7 @@ AIMD_CEILING  = 300
 AIMD_AI_AFTER = 5
 AIMD_MD_FATOR = 0.5
 
-TIMEOUT_PADRAO = aiohttp.ClientTimeout(total=5, connect=3)
+TIMEOUT_PADRAO = aiohttp.ClientTimeout(total=4, connect=2)
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [W{LOTE_ATUAL:02d}/{TOTAL_LOTES}] {msg}", flush=True)
