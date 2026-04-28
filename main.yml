@@ -1,0 +1,180 @@
+name: Coleta Musical
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+env:
+  LOGIN_MUSICAL: ${{ secrets.LOGIN_MUSICAL }}
+  SENHA_MUSICAL: ${{ secrets.SENHA_MUSICAL }}
+  PYTHONUNBUFFERED: "1"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ARQUITETURA DE JOBS:
+#
+#  [lider] ──→ upload: lider-context
+#                 ↓
+#  [worker matrix 1..4] ──→ download: lider-context
+#       ├─ lote 1 ──→ upload: output-lote-1   (IPs distintos no Azure pool)
+#       ├─ lote 2 ──→ upload: output-lote-2   = rate limit per-IP independente
+#       ├─ lote 3 ──→ upload: output-lote-3   por worker
+#       └─ lote 4 ──→ upload: output-lote-4
+#                 ↓
+#  [consolidador] ──→ download: lider-context + output-lote-*
+#       └─ merge + envio paralelo → Google Sheets
+#
+# Tempo estimado: ~2 (líder) + ~17 (workers) + ~2 (consolidador) = ~21 min
+# ═══════════════════════════════════════════════════════════════════════════════
+
+jobs:
+
+  # ── Job 1: Líder ─────────────────────────────────────────────────────────
+  lider:
+    name: "Líder — Login e Mapeamento"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Lider Login e Mapeamento
+        run: python 01_lider_auth.py
+
+      - name: Verificar saidas do Lider
+        run: |
+          for arq in session_cookies.json config_ranges.json seq1_localidades.json seq2_instrutores.json; do
+            if [ ! -f "$arq" ]; then
+              echo "ERRO: $arq nao gerado"
+              exit 1
+            fi
+          done
+          echo "Contexto OK"
+          cat config_ranges.json
+
+      - name: Publicar contexto para workers
+        uses: actions/upload-artifact@v4
+        with:
+          name: lider-context
+          path: |
+            session_cookies.json
+            config_ranges.json
+            seq1_localidades.json
+            seq2_instrutores.json
+          retention-days: 1
+
+  # ── Job 2: Workers (matrix 4 × paralelo) ─────────────────────────────────
+  worker:
+    name: "Worker — Lote ${{ matrix.lote }}/4"
+    needs: lider
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        lote: [1, 2, 3, 4]
+      max-parallel: 4
+      fail-fast: false   # falha de 1 lote não cancela os outros 3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Baixar contexto do Lider
+        uses: actions/download-artifact@v4
+        with:
+          name: lider-context
+
+      - name: Worker Coleta — Lote ${{ matrix.lote }}/4
+        env:
+          LOTE_ATUAL: ${{ matrix.lote }}
+          TOTAL_LOTES: 4
+        run: python 02_worker_master.py
+
+      - name: Publicar saida do lote
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-lote-${{ matrix.lote }}
+          path: output_lote_${{ matrix.lote }}.json
+          retention-days: 1
+
+  # ── Job 3: Consolidador ───────────────────────────────────────────────────
+  consolidador:
+    name: "Consolidador — Merge e Envio Google Sheets"
+    needs: [lider, worker]
+    # Roda mesmo que algum worker tenha falhado (fail-fast: false acima)
+    # mas só se o líder teve sucesso (sem contexto não há o que consolidar)
+    if: always() && needs.lider.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Baixar contexto do Lider
+        uses: actions/download-artifact@v4
+        with:
+          name: lider-context
+
+      - name: Baixar saidas de todos os workers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: output-lote-*
+          merge-multiple: true
+
+      - name: Verificar lotes recebidos
+        run: |
+          count=$(ls output_lote_*.json 2>/dev/null | wc -l)
+          echo "Lotes encontrados: $count / 4"
+          ls -lh output_lote_*.json 2>/dev/null || true
+          if [ "$count" -eq 0 ]; then
+            echo "ERRO: nenhum output_lote_*.json encontrado — abortando"
+            exit 1
+          fi
+          if [ "$count" -lt 4 ]; then
+            echo "AVISO: apenas $count/4 lotes disponíveis — consolidando parcialmente"
+          fi
+
+      - name: Consolidador Envio Google Sheets
+        run: python 03_consolidador.py
+
+      - name: Salvar backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-${{ github.run_id }}
+          path: |
+            output_lote_*.json
+            consolidado_*.json
+            seq1_localidades.json
+            seq2_instrutores.json
+            config_ranges.json
+          retention-days: 3
