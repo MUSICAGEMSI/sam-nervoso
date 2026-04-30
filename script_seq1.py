@@ -5,11 +5,13 @@ import json
 import asyncio
 import aiohttp
 import unicodedata
+import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+
 load_dotenv(dotenv_path="credencial.env")
 
 # ==================== CONFIGURAÇÕES GLOBAIS ====================
@@ -112,9 +114,11 @@ async def modulo_localidades(session, semaphore):
             print(f"✅ Localidade Encontrada: ID {res['id_igreja']} - {res['nome_localidade']}")
             
     # Envio para Sheets
-    import requests
     dados_sheet = [[r['id_igreja'], r['nome_localidade'], r['setor'], r['cidade'], r['texto_completo']] for r in resultados]
-    requests.post(URL_APPS_SCRIPT_LOCALIDADES, json={"tipo": "nova_planilha_localidades", "dados": dados_sheet})
+    try:
+        requests.post(URL_APPS_SCRIPT_LOCALIDADES, json={"tipo": "nova_planilha_localidades", "dados": dados_sheet})
+    except Exception as e:
+        print(f"⚠️ Erro no envio das localidades: {e}")
     
     return [r['id_igreja'] for r in resultados]
 
@@ -162,9 +166,12 @@ async def modulo_alunos(session, semaphore, ids_igrejas):
         print(f"📈 Progresso Alunos: {fim}/{ALUNOS_RANGE[1]}")
 
     # Envio para Sheets
-    import requests
     dados_sheet = [[a['id_aluno'], a['nome'], a['id_igreja'], a['cargo'], a['nivel'], a['instrumento'], a['status']] for a in todos_alunos]
-    requests.post(URL_APPS_SCRIPT_ALUNOS, json={"tipo": "nova_planilha_alunos", "dados": dados_sheet})
+    try:
+        requests.post(URL_APPS_SCRIPT_ALUNOS, json={"tipo": "nova_planilha_alunos", "dados": dados_sheet})
+    except Exception as e:
+        print(f"⚠️ Erro no envio dos alunos: {e}")
+        
     return todos_alunos
 
 # ==================== MÓDULO 3: HISTÓRICO ====================
@@ -204,18 +211,18 @@ async def modulo_historico(session, semaphore, alunos):
         json.dump(todos_historicos, f, ensure_ascii=False)
     
     # Envio para Sheets em Lotes (Fiel à estrutura de lotes)
-    import requests
     print("📤 Enviando Históricos para o Google Sheets...")
     for i in range(0, len(todos_historicos), 100):
         lote = todos_historicos[i:i+100]
-        requests.post(URL_APPS_SCRIPT_HISTORICO, json={"tipo": "licoes_alunos_lote", "dados": lote})
+        try:
+            requests.post(URL_APPS_SCRIPT_HISTORICO, json={"tipo": "licoes_alunos_lote", "dados": lote})
+        except Exception as e:
+            print(f"⚠️ Erro no envio do lote de históricos: {e}")
 
 # ==================== ORQUESTRADOR PRINCIPAL ====================
 
-async def main_rocket():
+async def main_rocket(cookies, ua):
     inicio_total = time.time()
-    cookies, ua = fazer_login_playwright()
-    if not cookies: return
 
     conn = aiohttp.TCPConnector(limit=MAX_CONEXOES)
     semaphore = asyncio.Semaphore(MAX_CONEXOES)
@@ -238,4 +245,9 @@ async def main_rocket():
     print("=" * 80 + "\n")
 
 if __name__ == "__main__":
-    asyncio.run(main_rocket())
+    # 1. Faz o login síncrono ANTES de iniciar o loop de eventos
+    cookies, ua = fazer_login_playwright()
+    
+    # 2. Se o login deu certo, injeta os dados e dispara o motor assíncrono
+    if cookies:
+        asyncio.run(main_rocket(cookies, ua))
