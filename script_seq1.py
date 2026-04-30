@@ -9,6 +9,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 load_dotenv(dotenv_path="credencial.env")
 
 # ==================== CONFIGURAÇÕES GLOBAIS ====================
