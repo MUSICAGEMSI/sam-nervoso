@@ -5,10 +5,13 @@ import json
 import asyncio
 import aiohttp
 import unicodedata
+import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+
 load_dotenv(dotenv_path="credencial.env")
 
 # ==================== CONFIGURAÇÕES GLOBAIS ====================
@@ -375,7 +378,6 @@ async def executar_historico_aulas_async(session, semaphore):
         json.dump(body, f, ensure_ascii=False, indent=2)
         
     print("\n📤 Enviando para Google Sheets...")
-    import requests # Usando síncrono pro Sheet pra simplificar
     try:
         req = requests.post(URL_APPS_SCRIPT_AULAS, json=body, timeout=300)
         if req.status_code == 200: print(f"✅ PLANILHA AULAS OK!")
@@ -485,7 +487,6 @@ async def executar_turmas_async(session, semaphore):
         "headers": ["ID_Turma", "Curso", "Descricao", "Comum", "Dia_Semana", "Data_Inicio", "Data_Encerramento", "Hora_Inicio", "Hora_Termino", "Responsavel_1_ID", "Responsavel_1_Nome", "Responsavel_2_ID", "Responsavel_2_Nome", "Destinado_ao", "Ativo", "Cadastrado_em", "Cadastrado_por", "Atualizado_em", "Atualizado_por", "Status_Coleta", "Data_Coleta"]
     }
     
-    import requests
     try:
         req = requests.post(URL_APPS_SCRIPT_TURMAS, json=body, timeout=120)
         if req.status_code == 200: print(f"✅ PLANILHA TURMAS OK!")
@@ -538,7 +539,6 @@ async def executar_matriculados_async(session, semaphore, ids_turmas):
     dados_alunos_envio = [["ID_Turma", "Nome", "Comum", "Instrumento", "Status"]] + [[a['ID_Turma'], a['Nome'], a['Comum'], a['Instrumento'], a['Status']] for a in todos_alunos]
     body = {"tipo": "contagem_matriculas", "dados": [["ID_Turma", "Quantidade_Matriculados", "Status_Coleta"]] + resultados_resumo}
     
-    import requests
     try:
         req = requests.post(URL_APPS_SCRIPT_MATRICULAS, json=body)
         if req.status_code == 200:
@@ -549,14 +549,10 @@ async def executar_matriculados_async(session, semaphore, ids_turmas):
 
 # ==================== MAIN ORQUESTRADOR ASYNC ====================
 
-async def main_async():
+async def main_async(cookies_dict, user_agent):
     tempo_total_inicio = time.time()
     
-    # 1. Login Síncrono via Playwright
-    cookies_dict, user_agent = fazer_login_unico_sync()
-    if not cookies_dict: return
-    
-    # 2. Abre a Sessão Assíncrona do "Trator"
+    # 2. Abre a Sessão Assíncrona do "Trator" com os cookies já coletados
     headers_globais = {
         'User-Agent': user_agent,
         'Accept': 'application/json, text/plain, */*',
@@ -584,5 +580,9 @@ async def main_async():
     print("=" * 80 + "\n")
 
 if __name__ == "__main__":
-    # Comando obrigatório para rodar código Async no Python
-    asyncio.run(main_async())
+    # 1. Faz o login síncrono ANTES de iniciar o loop de eventos
+    cookies, ua = fazer_login_unico_sync()
+    
+    # 2. Se o login deu certo, injeta os dados e dispara o motor assíncrono
+    if cookies:
+        asyncio.run(main_async(cookies, ua))
