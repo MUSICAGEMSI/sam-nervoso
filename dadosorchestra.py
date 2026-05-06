@@ -1,38 +1,58 @@
 import os
 import sys
 import re
+import json
 import asyncio
 import aiohttp
 import time
 import requests
 import random
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 from tqdm import tqdm
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURAÇÕES
 # ══════════════════════════════════════════════════════════════════════════════
-EMAIL  = os.environ.get("LOGIN_MUSICAL")
-SENHA  = os.environ.get("SENHA_MUSICAL")
+EMAIL           = os.environ.get("LOGIN_MUSICAL")
+SENHA           = os.environ.get("SENHA_MUSICAL")
 URL_INICIAL     = "https://musical.congregacao.org.br/"
-URL_APPS_SCRIPT = os.environ.get("APPS_SCRIPT_URL", "https://script.google.com/macros/library/d/1hBeANkb3D64gY6vWLv-0BsweH2ZdeQid0P95r3yGvkBySpPiQEvkLdQH/2")
+URL_APPS_SCRIPT = os.environ.get("APPS_SCRIPT_URL", "SUA_URL_AQUI")
 
 RANGE_INICIO = 1
 RANGE_FIM    = 850_000
 
-# ── Concorrência ──────────────────────────────────────────────────────────────
 SEMAPHORE_PHASE1 = 50
 SEMAPHORE_PHASE2 = 30
-
-TIMEOUT_FASE1 = 15.0
-TIMEOUT_FASE2 = 25.0
-
-CHUNK_SIZE = 20_000
-
-# Quantos membros acumular antes de enviar um lote ao Sheets
+TIMEOUT_FASE1    = 15.0
+TIMEOUT_FASE2    = 25.0
+CHUNK_SIZE       = 20_000
 SHEETS_BATCH_SIZE = 500
 
+CHECKPOINT_FILE = "/kaggle/working/checkpoint.json"
+MEMBROS_FILE    = "/kaggle/working/membros_coletados.jsonl"
+
 _IDS_VAZIOS: set[int] = set()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECKPOINT E BACKUP LOCAL
+# ══════════════════════════════════════════════════════════════════════════════
+def salvar_checkpoint(ultimo_id: int):
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump({"ultimo_id": ultimo_id}, f)
+
+def carregar_checkpoint() -> int:
+    if Path(CHECKPOINT_FILE).exists():
+        with open(CHECKPOINT_FILE) as f:
+            data = json.load(f)
+            ultimo = data.get("ultimo_id", RANGE_INICIO)
+            print(f"♻️  Checkpoint encontrado — retomando do ID {ultimo}")
+            return ultimo
+    return RANGE_INICIO
+
+def salvar_membro_local(dados: dict):
+    with open(MEMBROS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(dados, ensure_ascii=False) + "\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXTRAÇÃO E REGEX
@@ -46,23 +66,27 @@ RX_INSTRUMENTO = re.compile(_SEL.format(name="id_instrumento"), re.IGNORECASE)
 RX_TONALIDADE  = re.compile(_SEL.format(name="id_tonalidade"),  re.IGNORECASE)
 
 def extrair_dados(html: str, membro_id: int) -> dict | None:
-    if not html or 'name="nome"' not in html: return None
+    if not html or 'name="nome"' not in html:
+        return None
     m = RX_NOME.search(html)
-    if not m: return None
+    if not m:
+        return None
     nome = m.group(1).strip()
-    if not nome: return None
+    if not nome:
+        return None
 
     def _get(rx):
         r = rx.search(html)
         return r.group(1).strip() if r else ""
 
     return {
-        "id": membro_id, "nome": nome,
-        "igreja_selecionada":  _get(RX_IGREJA),
-        "cargo_ministerio":    _get(RX_CARGO),
-        "nivel":               _get(RX_NIVEL),
-        "instrumento":         _get(RX_INSTRUMENTO),
-        "tonalidade":          _get(RX_TONALIDADE),
+        "id":                 membro_id,
+        "nome":               nome,
+        "igreja_selecionada": _get(RX_IGREJA),
+        "cargo_ministerio":   _get(RX_CARGO),
+        "nivel":              _get(RX_NIVEL),
+        "instrumento":        _get(RX_INSTRUMENTO),
+        "tonalidade":         _get(RX_TONALIDADE),
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -81,21 +105,21 @@ def enviar_lote_sheets(membros: list[dict], tentativas: int = 3) -> bool:
                 json=payload,
                 timeout=60,
                 headers={"Content-Type": "application/json"},
-                allow_redirects=True,  # já é padrão, mas garante
+                allow_redirects=True,
             )
-            
-            # Debug para entender o que está chegando
+
             if not resp.text.strip():
-                print(f"\n  ⚠️  Resposta vazia do Apps Script (status {resp.status_code})")
+                print(f"\n  ⚠️  Resposta vazia (status {resp.status_code})")
                 time.sleep(5 * tentativa)
                 continue
-                
+
             data = resp.json()
             if data.get("ok"):
                 print(f"\n  📊 Sheets: +{data['gravados']} gravados (total: {data.get('total_na_aba', '?')})")
                 return True
             else:
                 print(f"\n  ⚠️  Sheets erro: {data.get('erro')} (tentativa {tentativa})")
+
         except requests.exceptions.JSONDecodeError:
             print(f"\n  ⚠️  Resposta não-JSON (tentativa {tentativa}): {resp.text[:200]}")
         except Exception as ex:
@@ -104,8 +128,9 @@ def enviar_lote_sheets(membros: list[dict], tentativas: int = 3) -> bool:
         if tentativa < tentativas:
             time.sleep(5 * tentativa)
 
-    print(f"\n  ✗ Lote com {len(membros)} membros não foi gravado após {tentativas} tentativas.")
+    print(f"\n  ✗ Lote com {len(membros)} membros não gravado após {tentativas} tentativas.")
     return False
+
 # ══════════════════════════════════════════════════════════════════════════════
 # COLETOR V5
 # ══════════════════════════════════════════════════════════════════════════════
@@ -120,7 +145,7 @@ class ColetorV5:
 
     def __init__(self, cookies: dict):
         self.cookies = cookies
-        self.stats = {"coletados": 0, "vazios": 0, "erros": 0, "enviados_sheets": 0}
+        self.stats   = {"coletados": 0, "vazios": 0, "erros": 0, "enviados_sheets": 0}
         self._retry2, self._retry3, self.membros = [], [], []
         self._buffer_sheets: list[dict] = []
         self._sheets_lock = asyncio.Lock()
@@ -166,12 +191,12 @@ class ColetorV5:
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                     if resp.status == 200:
-                        html = await resp.text(errors="ignore")
+                        html  = await resp.text(errors="ignore")
                         dados = extrair_dados(html, mid)
                         if dados:
                             self.membros.append(dados)
                             self.stats["coletados"] += 1
-                            salvar_membro_local(dados)
+                            salvar_membro_local(dados)          # ← backup local
                             async with self._sheets_lock:
                                 self._buffer_sheets.append(dados)
                             await self._flush_sheets_se_cheio()
@@ -179,13 +204,15 @@ class ColetorV5:
                             _IDS_VAZIOS.add(mid)
                             self.stats["vazios"] += 1
                     elif resp.status in [429, 502, 503, 504, 522]:
-                        if retry_list is not None: retry_list.append(mid)
+                        if retry_list is not None:
+                            retry_list.append(mid)
                         await asyncio.sleep(5)
                     else:
                         _IDS_VAZIOS.add(mid)
                         self.stats["vazios"] += 1
             except Exception:
-                if retry_list is not None: retry_list.append(mid)
+                if retry_list is not None:
+                    retry_list.append(mid)
                 self.stats["erros"] += 1
 
             await pbar_queue.put(1)
@@ -196,11 +223,12 @@ class ColetorV5:
         async def pbar_worker():
             while True:
                 val = await pbar_queue.get()
-                if val is None: break
+                if val is None:
+                    break
                 pbar.update(val)
 
         worker = asyncio.create_task(pbar_worker())
-        sem = asyncio.Semaphore(sem_n)
+        sem    = asyncio.Semaphore(sem_n)
         async with self._criar_sessao(sem_n) as session:
             await asyncio.gather(*[
                 self._coletar(session, mid, timeout, sem, retry_list, pbar_queue)
@@ -215,11 +243,11 @@ class ColetorV5:
 # ══════════════════════════════════════════════════════════════════════════════
 async def rodar(cookies):
     coletor = ColetorV5(cookies)
-    inicio = carregar_checkpoint()
-    todos_ids = list(range(RANGE_INICIO, RANGE_FIM + 1))
+    inicio  = carregar_checkpoint()                              # ← retoma checkpoint
+    todos_ids = list(range(inicio, RANGE_FIM + 1))
 
     print(f"📍 Iniciando do ID {inicio} ({len(todos_ids)} IDs restantes)")
-    print(f"\n🚀 MODO AMIGÁVEL: {SEMAPHORE_PHASE1} conexões simultâneas")
+    print(f"🚀 MODO AMIGÁVEL: {SEMAPHORE_PHASE1} conexões simultâneas")
     print(f"⏳ Jitter ativo (0.2s - 0.7s)")
     print(f"📊 Envio ao Sheets a cada {SHEETS_BATCH_SIZE} membros")
     print(f"🔗 Apps Script: {URL_APPS_SCRIPT[:70]}{'…' if len(URL_APPS_SCRIPT) > 70 else ''}\n")
@@ -229,7 +257,7 @@ async def rodar(cookies):
         chunks = [todos_ids[i:i + CHUNK_SIZE] for i in range(0, len(todos_ids), CHUNK_SIZE)]
         for c in chunks:
             await coletor._executar_fase(c, SEMAPHORE_PHASE1, TIMEOUT_FASE1, coletor._retry2, pbar)
-            salvar_checkpoint(c[-1])
+            salvar_checkpoint(c[-1])                            # ← salva após cada chunk
             await asyncio.sleep(2)
 
     # ── Fase 2 (retry) ────────────────────────────────────────────────────────
@@ -253,9 +281,9 @@ def login():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
-        page = context.new_page()
+        page    = context.new_page()
         page.goto(URL_INICIAL)
-        page.fill('input[name="login"]', EMAIL)
+        page.fill('input[name="login"]',    EMAIL)
         page.fill('input[name="password"]', SENHA)
         page.click('button[type="submit"]')
         page.wait_for_selector("nav")
@@ -274,7 +302,7 @@ if __name__ == "__main__":
     if URL_APPS_SCRIPT == "SUA_URL_AQUI":
         print("⚠️  AVISO: APPS_SCRIPT_URL não configurada. Dados NÃO serão enviados ao Sheets.\n")
 
-    ck = login()
+    ck  = login()
     res = asyncio.run(rodar(ck))
 
     print(
