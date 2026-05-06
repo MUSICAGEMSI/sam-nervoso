@@ -171,6 +171,7 @@ class ColetorV5:
                         if dados:
                             self.membros.append(dados)
                             self.stats["coletados"] += 1
+                            salvar_membro_local(dados)
                             async with self._sheets_lock:
                                 self._buffer_sheets.append(dados)
                             await self._flush_sheets_se_cheio()
@@ -214,8 +215,10 @@ class ColetorV5:
 # ══════════════════════════════════════════════════════════════════════════════
 async def rodar(cookies):
     coletor = ColetorV5(cookies)
+    inicio = carregar_checkpoint()
     todos_ids = list(range(RANGE_INICIO, RANGE_FIM + 1))
 
+    print(f"📍 Iniciando do ID {inicio} ({len(todos_ids)} IDs restantes)")
     print(f"\n🚀 MODO AMIGÁVEL: {SEMAPHORE_PHASE1} conexões simultâneas")
     print(f"⏳ Jitter ativo (0.2s - 0.7s)")
     print(f"📊 Envio ao Sheets a cada {SHEETS_BATCH_SIZE} membros")
@@ -226,6 +229,7 @@ async def rodar(cookies):
         chunks = [todos_ids[i:i + CHUNK_SIZE] for i in range(0, len(todos_ids), CHUNK_SIZE)]
         for c in chunks:
             await coletor._executar_fase(c, SEMAPHORE_PHASE1, TIMEOUT_FASE1, coletor._retry2, pbar)
+            salvar_checkpoint(c[-1])
             await asyncio.sleep(2)
 
     # ── Fase 2 (retry) ────────────────────────────────────────────────────────
