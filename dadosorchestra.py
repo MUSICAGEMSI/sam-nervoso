@@ -81,16 +81,23 @@ def enviar_lote_sheets(membros: list[dict], tentativas: int = 3) -> bool:
                 json=payload,
                 timeout=60,
                 headers={"Content-Type": "application/json"},
+                allow_redirects=True,  # já é padrão, mas garante
             )
+            
+            # Debug para entender o que está chegando
+            if not resp.text.strip():
+                print(f"\n  ⚠️  Resposta vazia do Apps Script (status {resp.status_code})")
+                time.sleep(5 * tentativa)
+                continue
+                
             data = resp.json()
             if data.get("ok"):
-                print(
-                    f"\n  📊 Sheets: +{data['gravados']} gravados "
-                    f"(total: {data.get('total_na_aba', '?')})"
-                )
+                print(f"\n  📊 Sheets: +{data['gravados']} gravados (total: {data.get('total_na_aba', '?')})")
                 return True
             else:
                 print(f"\n  ⚠️  Sheets erro: {data.get('erro')} (tentativa {tentativa})")
+        except requests.exceptions.JSONDecodeError:
+            print(f"\n  ⚠️  Resposta não-JSON (tentativa {tentativa}): {resp.text[:200]}")
         except Exception as ex:
             print(f"\n  ⚠️  Falha HTTP (tentativa {tentativa}): {ex}")
 
@@ -99,7 +106,6 @@ def enviar_lote_sheets(membros: list[dict], tentativas: int = 3) -> bool:
 
     print(f"\n  ✗ Lote com {len(membros)} membros não foi gravado após {tentativas} tentativas.")
     return False
-
 # ══════════════════════════════════════════════════════════════════════════════
 # COLETOR V5
 # ══════════════════════════════════════════════════════════════════════════════
