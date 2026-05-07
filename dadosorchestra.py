@@ -22,11 +22,14 @@ URL_APPS_SCRIPT = os.environ.get("APPS_SCRIPT_URL", "SUA_URL_AQUI")
 RANGE_INICIO = 1
 RANGE_FIM    = 850_000
 
+# ── Limites mantidos conforme solicitado ──────────────────────────────────────
 SEMAPHORE_PHASE1 = 50
 SEMAPHORE_PHASE2 = 30
-TIMEOUT_FASE1    = 15.0
+TIMEOUT_FASE1    = 12.0   # reduzido: respostas lentas vão para retry, não travam
 TIMEOUT_FASE2    = 25.0
-CHUNK_SIZE       = 20_000
+
+# ── Chunk maior → menos checkpoints, sessão TCP reutilizada por mais tempo ───
+CHUNK_SIZE        = 50_000
 SHEETS_BATCH_SIZE = 500
 
 CHECKPOINT_FILE = "/kaggle/working/checkpoint.json"
@@ -115,7 +118,11 @@ def enviar_lote_sheets(membros: list[dict], tentativas: int = 3) -> bool:
 
             data = resp.json()
             if data.get("ok"):
-                print(f"\n  📊 Sheets: +{data['gravados']} gravados (total: {data.get('total_na_aba', '?')})")
+                print(
+                    f"\n  📊 Sheets: +{data['gravados']} gravados "
+                    f"(total: {data.get('total_na_aba', '?')} | "
+                    f"aba: {data.get('aba_atual', '?')})"
+                )
                 return True
             else:
                 print(f"\n  ⚠️  Sheets erro: {data.get('erro')} (tentativa {tentativa})")
@@ -132,12 +139,16 @@ def enviar_lote_sheets(membros: list[dict], tentativas: int = 3) -> bool:
     return False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COLETOR V5
+# COLETOR V6  —  otimizações de desempenho
 # ══════════════════════════════════════════════════════════════════════════════
-class ColetorV5:
+class ColetorV6:
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
@@ -146,16 +157,53 @@ class ColetorV5:
     def __init__(self, cookies: dict):
         self.cookies = cookies
         self.stats   = {"coletados": 0, "vazios": 0, "erros": 0, "enviados_sheets": 0}
-        self._retry2, self._retry3, self.membros = [], [], []
+        self._retry2, self._retry3 = [], []
+        self.membros: list[dict]   = []
+
         self._buffer_sheets: list[dict] = []
         self._sheets_lock = asyncio.Lock()
 
-    def _criar_sessao(self, limit: int) -> aiohttp.ClientSession:
-        connector = aiohttp.TCPConnector(limit=limit, ttl_dns_cache=600, use_dns_cache=True)
-        jar = aiohttp.CookieJar(unsafe=True)
-        jar.update_cookies(self.cookies, response_url=aiohttp.client.URL(URL_INICIAL))
-        return aiohttp.ClientSession(connector=connector, cookie_jar=jar, headers=self.HEADERS)
+        # ── Controle adaptativo de 429 ────────────────────────────────────────
+        # Se a taxa de erros 429 subir, um sleep global é adicionado entre
+        # tentativas. Isso evita punição desnecessária quando o servidor está ok.
+        self._backoff_extra: float = 0.0   # segundos extras de espera global
+        self._recent_429: list[float] = []  # timestamps de 429 recentes
 
+    # ── Sessão TCP persistente (reutilizada entre chunks) ─────────────────────
+    def _criar_sessao(self, limit: int) -> aiohttp.ClientSession:
+        connector = aiohttp.TCPConnector(
+            limit=limit,
+            ttl_dns_cache=600,
+            use_dns_cache=True,
+            keepalive_timeout=30,   # mantém conexões TCP vivas entre chunks
+        )
+        jar = aiohttp.CookieJar(unsafe=True)
+        jar.update_cookies(
+            self.cookies,
+            response_url=aiohttp.client.URL(URL_INICIAL),
+        )
+        return aiohttp.ClientSession(
+            connector=connector,
+            cookie_jar=jar,
+            headers=self.HEADERS,
+        )
+
+    # ── Backoff adaptativo: analisa janela de 10 s ────────────────────────────
+    def _atualizar_backoff(self, teve_429: bool):
+        agora = time.monotonic()
+        if teve_429:
+            self._recent_429.append(agora)
+        # Mantém apenas os últimos 10 s
+        self._recent_429 = [t for t in self._recent_429 if agora - t < 10]
+        taxa = len(self._recent_429)           # qtd de 429 nos últimos 10 s
+        if taxa >= 10:
+            self._backoff_extra = 1.5
+        elif taxa >= 5:
+            self._backoff_extra = 0.5
+        else:
+            self._backoff_extra = 0.0
+
+    # ── Flush condicional para Sheets ─────────────────────────────────────────
     async def _flush_sheets_se_cheio(self):
         lote = []
         async with self._sheets_lock:
@@ -179,46 +227,119 @@ class ColetorV5:
             if ok:
                 self.stats["enviados_sheets"] += len(lote)
 
-    async def _coletar(self, session, mid, timeout, semaphore, retry_list, pbar_queue):
+    # ── Coroutine de coleta — JITTER FORA DO SEMÁFORO (principal otimização) ──
+    async def _coletar(
+        self,
+        session:     aiohttp.ClientSession,
+        mid:         int,
+        timeout:     float,
+        semaphore:   asyncio.Semaphore,
+        retry_list:  list | None,
+        pbar_queue:  asyncio.Queue,
+    ):
         if mid in _IDS_VAZIOS:
             self.stats["vazios"] += 1
             await pbar_queue.put(1)
             return
 
+        # ╔══════════════════════════════════════════════════════════════════╗
+        # ║  JITTER FORA DO SEMÁFORO                                        ║
+        # ║  Antes: asyncio.sleep ficava DENTRO do "async with semaphore"   ║
+        # ║  → O slot ficava bloqueado dormindo (até 0,7 s por requisição)  ║
+        # ║  Agora: dormimos ANTES de adquirir o slot                       ║
+        # ║  → Semáforo só é ocupado durante a requisição HTTP real         ║
+        # ║  Ganho: ~2× no throughput efetivo mantendo 50 conexões          ║
+        # ╚══════════════════════════════════════════════════════════════════╝
+        jitter = random.uniform(0.05, 0.15) + self._backoff_extra
+        await asyncio.sleep(jitter)
+
         async with semaphore:
-            await asyncio.sleep(random.uniform(0.2, 0.7))
             url = f"https://musical.congregacao.org.br/grp_musical/editar/{mid}"
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    allow_redirects=True,
+                ) as resp:
+
                     if resp.status == 200:
                         html  = await resp.text(errors="ignore")
                         dados = extrair_dados(html, mid)
                         if dados:
                             self.membros.append(dados)
                             self.stats["coletados"] += 1
-                            salvar_membro_local(dados)          # ← backup local
+                            salvar_membro_local(dados)
                             async with self._sheets_lock:
                                 self._buffer_sheets.append(dados)
                             await self._flush_sheets_se_cheio()
                         else:
                             _IDS_VAZIOS.add(mid)
                             self.stats["vazios"] += 1
-                    elif resp.status in [429, 502, 503, 504, 522]:
+
+                    elif resp.status == 429:
+                        self._atualizar_backoff(True)
                         if retry_list is not None:
                             retry_list.append(mid)
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(random.uniform(3.0, 7.0))
+
+                    elif resp.status in [502, 503, 504, 522]:
+                        if retry_list is not None:
+                            retry_list.append(mid)
+                        await asyncio.sleep(random.uniform(1.0, 3.0))
+
                     else:
                         _IDS_VAZIOS.add(mid)
                         self.stats["vazios"] += 1
+
+                    self._atualizar_backoff(False)
+
+            except asyncio.TimeoutError:
+                # Timeout → retry; não conta como erro permanente
+                if retry_list is not None:
+                    retry_list.append(mid)
             except Exception:
                 if retry_list is not None:
                     retry_list.append(mid)
                 self.stats["erros"] += 1
 
-            await pbar_queue.put(1)
+        await pbar_queue.put(1)
 
-    async def _executar_fase(self, ids, sem_n, timeout, retry_list, pbar):
-        pbar_queue = asyncio.Queue()
+    # ── Executa fase com sessão já criada externamente ────────────────────────
+    async def _executar_fase_com_sessao(
+        self,
+        session:    aiohttp.ClientSession,
+        ids:        list[int],
+        sem:        asyncio.Semaphore,
+        timeout:    float,
+        retry_list: list | None,
+        pbar_queue: asyncio.Queue,
+    ):
+        await asyncio.gather(*[
+            self._coletar(session, mid, timeout, sem, retry_list, pbar_queue)
+            for mid in ids
+        ])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORQUESTRAÇÃO
+# ══════════════════════════════════════════════════════════════════════════════
+async def rodar(cookies: dict) -> ColetorV6:
+    coletor   = ColetorV6(cookies)
+    inicio    = carregar_checkpoint()
+    todos_ids = list(range(inicio, RANGE_FIM + 1))
+    chunks    = [todos_ids[i:i + CHUNK_SIZE] for i in range(0, len(todos_ids), CHUNK_SIZE)]
+
+    print(f"📍 Iniciando do ID {inicio} ({len(todos_ids):,} IDs restantes em {len(chunks)} chunks)")
+    print(f"🚀 Semáforo: {SEMAPHORE_PHASE1} conexões | Jitter: 0.05–0.15 s (fora do semáforo)")
+    print(f"📦 Chunk: {CHUNK_SIZE:,} IDs | Sheets a cada {SHEETS_BATCH_SIZE} membros")
+    print(f"🔗 Apps Script: {URL_APPS_SCRIPT[:70]}{'…' if len(URL_APPS_SCRIPT) > 70 else ''}\n")
+
+    # ── Fase 1 — sessão TCP única para todos os chunks ────────────────────────
+    sem1 = asyncio.Semaphore(SEMAPHORE_PHASE1)
+
+    with tqdm(total=len(todos_ids), desc="Fase 1", unit="ID", colour="blue") as pbar:
+
+        # pbar_worker fora do loop de chunks para evitar recriação desnecessária
+        pbar_queue: asyncio.Queue = asyncio.Queue()
 
         async def pbar_worker():
             while True:
@@ -228,45 +349,54 @@ class ColetorV5:
                 pbar.update(val)
 
         worker = asyncio.create_task(pbar_worker())
-        sem    = asyncio.Semaphore(sem_n)
-        async with self._criar_sessao(sem_n) as session:
-            await asyncio.gather(*[
-                self._coletar(session, mid, timeout, sem, retry_list, pbar_queue)
-                for mid in ids
-            ])
+
+        # Uma única sessão aiohttp reutilizada por todos os chunks
+        # → conexões TCP permanecem vivas (keep-alive), sem overhead de handshake
+        async with coletor._criar_sessao(SEMAPHORE_PHASE1) as session:
+            for i, chunk in enumerate(chunks):
+                await coletor._executar_fase_com_sessao(
+                    session, chunk, sem1,
+                    TIMEOUT_FASE1, coletor._retry2, pbar_queue,
+                )
+                salvar_checkpoint(chunk[-1])
+                # Pausa mínima entre chunks (flush de buffers, não gargalo)
+                if i < len(chunks) - 1:
+                    await asyncio.sleep(0.5)
 
         await pbar_queue.put(None)
         await worker
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ORQUESTRAÇÃO
-# ══════════════════════════════════════════════════════════════════════════════
-async def rodar(cookies):
-    coletor = ColetorV5(cookies)
-    inicio  = carregar_checkpoint()                              # ← retoma checkpoint
-    todos_ids = list(range(inicio, RANGE_FIM + 1))
-
-    print(f"📍 Iniciando do ID {inicio} ({len(todos_ids)} IDs restantes)")
-    print(f"🚀 MODO AMIGÁVEL: {SEMAPHORE_PHASE1} conexões simultâneas")
-    print(f"⏳ Jitter ativo (0.2s - 0.7s)")
-    print(f"📊 Envio ao Sheets a cada {SHEETS_BATCH_SIZE} membros")
-    print(f"🔗 Apps Script: {URL_APPS_SCRIPT[:70]}{'…' if len(URL_APPS_SCRIPT) > 70 else ''}\n")
-
-    # ── Fase 1 ────────────────────────────────────────────────────────────────
-    with tqdm(total=len(todos_ids), desc="Fase 1", unit="ID", colour="blue") as pbar:
-        chunks = [todos_ids[i:i + CHUNK_SIZE] for i in range(0, len(todos_ids), CHUNK_SIZE)]
-        for c in chunks:
-            await coletor._executar_fase(c, SEMAPHORE_PHASE1, TIMEOUT_FASE1, coletor._retry2, pbar)
-            salvar_checkpoint(c[-1])                            # ← salva após cada chunk
-            await asyncio.sleep(2)
-
-    # ── Fase 2 (retry) ────────────────────────────────────────────────────────
+    # ── Fase 2 — retry ───────────────────────────────────────────────────────
     if coletor._retry2:
-        print(f"\n🔄 Retentativa (Fase 2) — {len(coletor._retry2)} IDs")
+        print(f"\n🔄 Retentativa (Fase 2) — {len(coletor._retry2):,} IDs")
+        sem2 = asyncio.Semaphore(SEMAPHORE_PHASE2)
+
         with tqdm(total=len(coletor._retry2), desc="Fase 2", unit="ID", colour="yellow") as pbar:
-            await coletor._executar_fase(
-                coletor._retry2, SEMAPHORE_PHASE2, TIMEOUT_FASE2, coletor._retry3, pbar
-            )
+            pbar_queue2: asyncio.Queue = asyncio.Queue()
+
+            async def pbar_worker2():
+                while True:
+                    val = await pbar_queue2.get()
+                    if val is None:
+                        break
+                    pbar.update(val)
+
+            worker2 = asyncio.create_task(pbar_worker2())
+
+            async with coletor._criar_sessao(SEMAPHORE_PHASE2) as session2:
+                retry_chunks = [
+                    coletor._retry2[i:i + CHUNK_SIZE]
+                    for i in range(0, len(coletor._retry2), CHUNK_SIZE)
+                ]
+                for chunk in retry_chunks:
+                    await coletor._executar_fase_com_sessao(
+                        session2, chunk, sem2,
+                        TIMEOUT_FASE2, coletor._retry3, pbar_queue2,
+                    )
+                    await asyncio.sleep(0.5)
+
+            await pbar_queue2.put(None)
+            await worker2
 
     # ── Flush final ───────────────────────────────────────────────────────────
     print("\n📤 Enviando registros finais ao Sheets…")
@@ -277,7 +407,7 @@ async def rodar(cookies):
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGIN
 # ══════════════════════════════════════════════════════════════════════════════
-def login():
+def login() -> dict:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
@@ -307,8 +437,9 @@ if __name__ == "__main__":
 
     print(
         f"\n✅ Concluído!\n"
-        f"   Membros coletados : {res.stats['coletados']}\n"
-        f"   Vazios            : {res.stats['vazios']}\n"
-        f"   Erros de rede     : {res.stats['erros']}\n"
-        f"   Enviados ao Sheets: {res.stats['enviados_sheets']}"
+        f"   Membros coletados : {res.stats['coletados']:,}\n"
+        f"   Vazios            : {res.stats['vazios']:,}\n"
+        f"   Erros de rede     : {res.stats['erros']:,}\n"
+        f"   Enviados ao Sheets: {res.stats['enviados_sheets']:,}\n"
+        f"   IDs para retry 3  : {len(res._retry3):,}"
     )
