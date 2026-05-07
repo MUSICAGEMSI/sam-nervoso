@@ -22,11 +22,14 @@ URL_APPS_SCRIPT = os.environ.get("APPS_SCRIPT_URL", "SUA_URL_AQUI")
 RANGE_INICIO = 1
 RANGE_FIM    = 850_000
 
-NUM_WORKERS      = 50    # workers fase 1  — mantido conforme solicitado
-NUM_WORKERS_R    = 30    # workers fase 2 (retry)
-TIMEOUT_FASE1    = 10.0  # timeout reduzido: respostas lentas → retry, não travam worker
-TIMEOUT_FASE2    = 20.0
-CHUNK_SIZE       = 10_000   # checkpoint a cada 10 K IDs (~100 s de trabalho)
+# ── Workers: 300 conexões @ 10s médios = apenas 30 req/s no servidor ─────────
+# (antes: 50 workers @ 10s = 5 req/s — literalmente impossível fazer mais rápido)
+NUM_WORKERS   = 300
+NUM_WORKERS_R = 100
+TIMEOUT_FASE1 = 12.0
+TIMEOUT_FASE2 = 22.0
+
+CHUNK_SIZE        = 10_000
 SHEETS_BATCH_SIZE = 500
 
 CHECKPOINT_FILE = "/kaggle/working/checkpoint.json"
@@ -44,7 +47,7 @@ def salvar_checkpoint(ultimo_id: int):
 def carregar_checkpoint() -> int:
     if Path(CHECKPOINT_FILE).exists():
         with open(CHECKPOINT_FILE) as f:
-            data  = json.load(f)
+            data   = json.load(f)
             ultimo = data.get("ultimo_id", RANGE_INICIO)
             print(f"♻️  Checkpoint — retomando do ID {ultimo:,}")
             return ultimo
@@ -107,36 +110,91 @@ def enviar_lote_sheets(membros: list[dict], tentativas: int = 3) -> bool:
             data = resp.json()
             if data.get("ok"):
                 print(
-                    f"\n  📊 Sheets: +{data['gravados']} | "
+                    f"\n  📊 Sheets +{data['gravados']} | "
                     f"total: {data.get('total_na_aba','?')} | "
                     f"aba: {data.get('aba_atual','?')}"
                 )
                 return True
             print(f"\n  ⚠️  Sheets erro: {data.get('erro')} (t{tentativa})")
         except Exception as ex:
-            print(f"\n  ⚠️  Falha HTTP (t{tentativa}): {ex}")
+            print(f"\n  ⚠️  HTTP (t{tentativa}): {ex}")
         if tentativa < tentativas:
             time.sleep(5 * tentativa)
     return False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COLETOR — padrão Worker Pool
+# DIAGNÓSTICO — roda antes da coleta para medir o servidor
 # ══════════════════════════════════════════════════════════════════════════════
-class ColetorV7:
+async def diagnosticar(cookies: dict):
     """
-    Arquitetura Worker Pool:
-    - N workers fixos consomem de uma asyncio.Queue
-    - Sem asyncio.gather() em cima de 50K coroutines
-    - Sem semáforo (a fila + workers já controlam a concorrência)
-    - Cada worker fica 100% ocupado fazendo I/O, nunca dormindo
-    - Backoff ativado apenas quando 429s aparecem
+    Mede o tempo médio de resposta do servidor e detecta se IDs vazios
+    retornam redirect (rápido) ou 200 (lento, precisamos baixar HTML).
+    Isso determina o throughput máximo possível.
+    """
+    print("🔬 Diagnóstico do servidor (10 amostras)…")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
+        "Accept": "text/html,*/*;q=0.8",
+    }
+    jar = aiohttp.CookieJar(unsafe=True)
+    jar.update_cookies(cookies, response_url=aiohttp.client.URL(URL_INICIAL))
+
+    amostras_vazias = []
+    amostras_cheias = []
+
+    async with aiohttp.ClientSession(cookie_jar=jar, headers=headers) as session:
+        # Testa IDs no início do range (provavelmente vazios)
+        for mid in range(1, 11):
+            t0 = time.monotonic()
+            try:
+                async with session.get(
+                    f"https://musical.congregacao.org.br/grp_musical/editar/{mid}",
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=False,   # detecta redirect sem seguir
+                ) as resp:
+                    elapsed = time.monotonic() - t0
+                    if resp.status in (301, 302, 303, 307, 308):
+                        amostras_vazias.append(elapsed)
+                        tipo = f"REDIRECT → {resp.headers.get('Location','?')[:50]}"
+                    elif resp.status == 200:
+                        html = await resp.text(errors="ignore")
+                        tem_dado = 'name="nome"' in html
+                        amostras_cheias.append(elapsed) if tem_dado else amostras_vazias.append(elapsed)
+                        tipo = "200+DADOS" if tem_dado else "200+VAZIO"
+                    else:
+                        amostras_vazias.append(elapsed)
+                        tipo = f"HTTP {resp.status}"
+                    print(f"   ID {mid:>6}: {elapsed:.2f}s  [{tipo}]")
+            except Exception as ex:
+                print(f"   ID {mid:>6}: ERRO — {ex}")
+
+    med_vazio = (sum(amostras_vazias) / len(amostras_vazias)) if amostras_vazias else 0
+    med_cheio = (sum(amostras_cheias) / len(amostras_cheias)) if amostras_cheias else 0
+    print(f"\n   ⏱  Média IDs vazios : {med_vazio:.2f}s")
+    print(f"   ⏱  Média IDs com dado: {med_cheio:.2f}s")
+    print(f"   📈 Throughput estimado ({NUM_WORKERS} workers): "
+          f"~{NUM_WORKERS / max(med_vazio, 0.05):.0f} ID/s (vazios)\n")
+    return med_vazio, med_cheio
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COLETOR — Worker Pool + detecção rápida de redirect
+# ══════════════════════════════════════════════════════════════════════════════
+class ColetorV8:
+    """
+    Estratégia dupla por requisição:
+    1. GET com allow_redirects=False  →  se redirecionar = vazio, PULAMOS o body
+                                          custo: apenas o RTT do request inicial (~50-200ms)
+    2. Se status 200                  →  baixamos o HTML e extraímos dados
+                                          custo: response_time completo (~2-15s)
+
+    Isso separa os IDs vazios (rápidos) dos válidos (lentos), aumentando o
+    throughput efetivo mesmo mantendo a carga total sobre o servidor baixa.
     """
 
     HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9",
@@ -145,8 +203,11 @@ class ColetorV7:
     }
 
     def __init__(self, cookies: dict):
-        self.cookies  = cookies
-        self.stats    = {"coletados": 0, "vazios": 0, "erros": 0, "enviados_sheets": 0}
+        self.cookies = cookies
+        self.stats   = {
+            "coletados": 0, "vazios": 0, "erros": 0,
+            "enviados_sheets": 0, "redirects": 0,
+        }
         self._retry2: list[int] = []
         self._retry3: list[int] = []
         self.membros: list[dict] = []
@@ -154,16 +215,20 @@ class ColetorV7:
         self._buffer_sheets: list[dict] = []
         self._sheets_lock = asyncio.Lock()
 
-        # Backoff global: só ativa quando 429s surgem
-        self._backoff_extra: float    = 0.0
-        self._recent_429:   list[float] = []
+        self._backoff_extra: float      = 0.0
+        self._recent_429: list[float]   = []
 
-    def _criar_sessao(self, n_workers: int) -> aiohttp.ClientSession:
+        # Stats de tempo para ajuste dinâmico
+        self._tempo_total:  float = 0.0
+        self._reqs_ok:      int   = 0
+
+    def _criar_sessao(self, n: int) -> aiohttp.ClientSession:
         connector = aiohttp.TCPConnector(
-            limit=n_workers + 5,   # leve margem acima do nº de workers
-            ttl_dns_cache=600,
-            use_dns_cache=True,
-            keepalive_timeout=60,
+            limit            = n + 20,
+            ttl_dns_cache    = 600,
+            use_dns_cache    = True,
+            keepalive_timeout= 60,
+            enable_cleanup_closed=True,
         )
         jar = aiohttp.CookieJar(unsafe=True)
         jar.update_cookies(self.cookies, response_url=aiohttp.client.URL(URL_INICIAL))
@@ -175,7 +240,7 @@ class ColetorV7:
             self._recent_429.append(agora)
         self._recent_429 = [t for t in self._recent_429 if agora - t < 10]
         n = len(self._recent_429)
-        self._backoff_extra = 1.5 if n >= 10 else (0.5 if n >= 5 else 0.0)
+        self._backoff_extra = 2.0 if n >= 10 else (0.8 if n >= 5 else 0.0)
 
     async def _flush_se_cheio(self):
         lote = []
@@ -198,7 +263,6 @@ class ColetorV7:
             if ok:
                 self.stats["enviados_sheets"] += len(lote)
 
-    # ── Worker: consome IDs da fila até ela esvaziar ──────────────────────────
     async def _worker(
         self,
         session:    aiohttp.ClientSession,
@@ -211,7 +275,7 @@ class ColetorV7:
             try:
                 mid = fila.get_nowait()
             except asyncio.QueueEmpty:
-                return   # fila vazia → worker encerra
+                return
 
             if mid in _IDS_VAZIOS:
                 self.stats["vazios"] += 1
@@ -219,19 +283,29 @@ class ColetorV7:
                 fila.task_done()
                 continue
 
-            # Backoff global (só ativo se houver 429s recentes)
             if self._backoff_extra > 0:
-                await asyncio.sleep(self._backoff_extra + random.uniform(0, 0.3))
+                await asyncio.sleep(self._backoff_extra + random.uniform(0, 0.5))
 
             url = f"https://musical.congregacao.org.br/grp_musical/editar/{mid}"
+            t0  = time.monotonic()
             try:
+                # ── Passo 1: GET sem seguir redirect ─────────────────────────
+                # IDs inexistentes costumam redirecionar para lista/login.
+                # Detectar isso evita baixar HTML desnecessariamente.
                 async with session.get(
                     url,
                     timeout=aiohttp.ClientTimeout(total=timeout),
-                    allow_redirects=True,
+                    allow_redirects=False,   # ← chave da otimização
                 ) as resp:
 
-                    if resp.status == 200:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        # Redirect = membro não existe (muito rápido, só RTT)
+                        _IDS_VAZIOS.add(mid)
+                        self.stats["vazios"]    += 1
+                        self.stats["redirects"] += 1
+
+                    elif resp.status == 200:
+                        # ── Passo 2: só aqui baixamos o body ─────────────────
                         html  = await resp.text(errors="ignore")
                         dados = extrair_dados(html, mid)
                         if dados:
@@ -249,7 +323,7 @@ class ColetorV7:
                         self._atualizar_backoff(True)
                         if retry_list is not None:
                             retry_list.append(mid)
-                        await asyncio.sleep(random.uniform(4.0, 8.0))
+                        await asyncio.sleep(random.uniform(5.0, 10.0))
 
                     elif resp.status in (502, 503, 504, 522):
                         if retry_list is not None:
@@ -261,6 +335,9 @@ class ColetorV7:
                         self.stats["vazios"] += 1
 
                     self._atualizar_backoff(False)
+                    elapsed = time.monotonic() - t0
+                    self._tempo_total += elapsed
+                    self._reqs_ok     += 1
 
             except asyncio.TimeoutError:
                 if retry_list is not None:
@@ -273,7 +350,6 @@ class ColetorV7:
             await pbar_queue.put(1)
             fila.task_done()
 
-    # ── Roda uma lista de IDs com N workers e sessão já criada ───────────────
     async def _executar(
         self,
         session:    aiohttp.ClientSession,
@@ -287,47 +363,59 @@ class ColetorV7:
         for mid in ids:
             fila.put_nowait(mid)
 
-        # Exatamente N workers — sem coroutines ociosas empilhadas
-        workers = [
+        n = min(n_workers, len(ids))
+        await asyncio.gather(*[
             asyncio.create_task(
                 self._worker(session, fila, timeout, retry_list, pbar_queue)
             )
-            for _ in range(min(n_workers, len(ids)))
-        ]
-        await asyncio.gather(*workers)
+            for _ in range(n)
+        ])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ORQUESTRAÇÃO
 # ══════════════════════════════════════════════════════════════════════════════
-async def rodar(cookies: dict) -> ColetorV7:
-    coletor   = ColetorV7(cookies)
+async def rodar(cookies: dict) -> ColetorV8:
+    # Diagnóstico primeiro — entender o servidor antes de bombardeá-lo
+    await diagnosticar(cookies)
+
+    coletor   = ColetorV8(cookies)
     inicio    = carregar_checkpoint()
     todos_ids = list(range(inicio, RANGE_FIM + 1))
     chunks    = [todos_ids[i:i + CHUNK_SIZE] for i in range(0, len(todos_ids), CHUNK_SIZE)]
 
-    print(f"📍 ID inicial : {inicio:,}  ({len(todos_ids):,} IDs em {len(chunks)} chunks)")
-    print(f"🚀 Workers    : {NUM_WORKERS} (Fase 1) / {NUM_WORKERS_R} (Retry)")
-    print(f"📦 Chunk      : {CHUNK_SIZE:,} IDs  |  Sheets a cada {SHEETS_BATCH_SIZE}")
-    print(f"🔗 Apps Script: {URL_APPS_SCRIPT[:70]}{'…' if len(URL_APPS_SCRIPT)>70 else ''}\n")
+    print(f"📍 ID inicial  : {inicio:,}  ({len(todos_ids):,} IDs / {len(chunks)} chunks)")
+    print(f"🚀 Workers     : {NUM_WORKERS} fase1 / {NUM_WORKERS_R} retry")
+    print(f"⚡ Redirect-skip: IDs vazios detectados sem baixar HTML")
+    print(f"📦 Chunk       : {CHUNK_SIZE:,}  |  Sheets a cada {SHEETS_BATCH_SIZE}\n")
 
-    # ── pbar_worker único para toda a Fase 1 ─────────────────────────────────
     pbar_queue: asyncio.Queue = asyncio.Queue()
 
     async def pbar_worker():
+        last_report = time.monotonic()
         while True:
             v = await pbar_queue.get()
             if v is None:
                 break
             pbar.update(v)
+            # Relatório de velocidade a cada 30s
+            agora = time.monotonic()
+            if agora - last_report >= 30:
+                med = (coletor._tempo_total / coletor._reqs_ok) if coletor._reqs_ok else 0
+                print(
+                    f"\n  ⚡ {pbar.n:,} IDs | "
+                    f"coletados: {coletor.stats['coletados']:,} | "
+                    f"redirects: {coletor.stats['redirects']:,} | "
+                    f"tempo médio req: {med:.2f}s | "
+                    f"backoff: {coletor._backoff_extra:.1f}s"
+                )
+                last_report = agora
 
-    # ── Fase 1 — sessão TCP única, reutilizada entre todos os chunks ──────────
     with tqdm(
         total=len(todos_ids), desc="Fase 1",
         unit="ID", unit_scale=True, colour="blue",
         dynamic_ncols=True,
     ) as pbar:
         pb_task = asyncio.create_task(pbar_worker())
-
         async with coletor._criar_sessao(NUM_WORKERS) as session:
             for i, chunk in enumerate(chunks):
                 await coletor._executar(
@@ -336,19 +424,13 @@ async def rodar(cookies: dict) -> ColetorV7:
                 )
                 salvar_checkpoint(chunk[-1])
                 if i < len(chunks) - 1:
-                    await asyncio.sleep(0.2)   # pausa mínima entre chunks
-
+                    await asyncio.sleep(0.1)
         await pbar_queue.put(None)
         await pb_task
 
-    # ── Fase 2 — retry ───────────────────────────────────────────────────────
     if coletor._retry2:
         print(f"\n🔄 Retry (Fase 2) — {len(coletor._retry2):,} IDs")
         pbar_queue2: asyncio.Queue = asyncio.Queue()
-        r_chunks = [
-            coletor._retry2[i:i + CHUNK_SIZE]
-            for i in range(0, len(coletor._retry2), CHUNK_SIZE)
-        ]
 
         async def pbar_worker2():
             while True:
@@ -357,6 +439,10 @@ async def rodar(cookies: dict) -> ColetorV7:
                     break
                 pbar2.update(v)
 
+        r_chunks = [
+            coletor._retry2[i:i + CHUNK_SIZE]
+            for i in range(0, len(coletor._retry2), CHUNK_SIZE)
+        ]
         with tqdm(
             total=len(coletor._retry2), desc="Fase 2",
             unit="ID", unit_scale=True, colour="yellow",
@@ -369,14 +455,12 @@ async def rodar(cookies: dict) -> ColetorV7:
                         session2, chunk, NUM_WORKERS_R,
                         TIMEOUT_FASE2, coletor._retry3, pbar_queue2,
                     )
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.1)
             await pbar_queue2.put(None)
             await pb_task2
 
-    # ── Flush final ───────────────────────────────────────────────────────────
     print("\n📤 Enviando registros finais ao Sheets…")
     await coletor._flush_forcado()
-
     return coletor
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -404,16 +488,19 @@ if __name__ == "__main__":
         print("✗ Credenciais não encontradas.")
         sys.exit(1)
     if URL_APPS_SCRIPT == "SUA_URL_AQUI":
-        print("⚠️  APPS_SCRIPT_URL não configurada — dados não irão ao Sheets.\n")
+        print("⚠️  APPS_SCRIPT_URL não configurada — sem envio ao Sheets.\n")
 
     ck  = login()
     res = asyncio.run(rodar(ck))
 
+    med = (res._tempo_total / res._reqs_ok) if res._reqs_ok else 0
     print(
         f"\n✅ Concluído!\n"
-        f"   Coletados         : {res.stats['coletados']:,}\n"
-        f"   Vazios/inexistentes: {res.stats['vazios']:,}\n"
-        f"   Erros de rede     : {res.stats['erros']:,}\n"
-        f"   Enviados ao Sheets: {res.stats['enviados_sheets']:,}\n"
-        f"   Fila retry 3      : {len(res._retry3):,}"
+        f"   Coletados          : {res.stats['coletados']:,}\n"
+        f"   Vazios (200+vazio) : {res.stats['vazios'] - res.stats['redirects']:,}\n"
+        f"   Redirects (rápido) : {res.stats['redirects']:,}\n"
+        f"   Erros de rede      : {res.stats['erros']:,}\n"
+        f"   Enviados ao Sheets : {res.stats['enviados_sheets']:,}\n"
+        f"   Tempo médio/req    : {med:.2f}s\n"
+        f"   Fila retry 3       : {len(res._retry3):,}"
     )
