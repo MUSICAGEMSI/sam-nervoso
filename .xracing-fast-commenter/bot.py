@@ -1,187 +1,61 @@
 import os
-import json
 import random
 import requests
 import feedparser
-
-from datetime import datetime
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 
-
-# ==================================================
-# XRACING CONFIG
-# ==================================================
-
-
 CHANNEL_ID = "UCW3oIxTLllTLK3Vy9jzdoEg"
 
 
-RSS_URL = (
+RSS = (
     "https://www.youtube.com/feeds/videos.xml?"
     f"channel_id={CHANNEL_ID}"
 )
 
 
+def youtube():
 
-DATABASE = "database.json"
+    token = os.environ["YOUTUBE_TOKEN"]
 
-COMMENTS = "comments.json"
-
-
-DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
-
-
-
-# ==================================================
-# FILES
-# ==================================================
-
-
-def load_json(path):
-
-    with open(
-        path,
-        encoding="utf-8"
-    ) as f:
-
-        return json.load(f)
-
-
-
-def save_json(path,data):
-
-    with open(
-        path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            data,
-            f,
-            indent=4,
-            ensure_ascii=False
-        )
-
-
-
-# ==================================================
-# DISCORD
-# ==================================================
-
-
-def send_discord(message):
-
-    try:
-
-        requests.post(
-            DISCORD_WEBHOOK,
-            json={
-                "content":message
-            },
-            timeout=10
-        )
-
-    except Exception as e:
-
-        print(
-            "Discord erro:",
-            e
-        )
-
-
-
-# ==================================================
-# YOUTUBE AUTH
-# ==================================================
-
-
-def youtube_client():
-
-
-    token=json.loads(
-        os.environ["YOUTUBE_TOKEN"]
-    )
-
-
-    credentials = Credentials.from_authorized_user_info(
-
-        token,
-
+    creds = Credentials.from_authorized_user_info(
+        eval(token),
         [
         "https://www.googleapis.com/auth/youtube.force-ssl"
         ]
-
     )
-
 
     return build(
         "youtube",
         "v3",
-        credentials=credentials
+        credentials=creds
     )
 
 
 
-# ==================================================
-# FIND VIDEO
-# ==================================================
+def novo_video():
 
+    feed = feedparser.parse(RSS)
 
-def get_latest_video():
-
-
-    feed = feedparser.parse(
-        RSS_URL
-    )
-
-
-    if not feed.entries:
-
-        return None
+    return feed.entries[0].yt_videoid
 
 
 
-    item = feed.entries[0]
+def comentar(video):
+
+    api = youtube()
 
 
-    return {
-
-        "id":
-            item.yt_videoid,
+    with open("comments.txt") as f:
+        comentarios=f.readlines()
 
 
-        "title":
-            item.title,
+    texto=random.choice(comentarios).strip()
 
 
-        "url":
-            f"https://youtube.com/watch?v={item.yt_videoid}"
-
-    }
-
-
-
-# ==================================================
-# COMMENT
-# ==================================================
-
-
-def comment(video_id):
-
-
-    youtube = youtube_client()
-
-
-    text=random.choice(
-        load_json(COMMENTS)
-    )
-
-
-    youtube.commentThreads().insert(
+    api.commentThreads().insert(
 
         part="snippet",
 
@@ -189,14 +63,13 @@ def comment(video_id):
 
             "snippet":{
 
-                "videoId":video_id,
-
+                "videoId":video,
 
                 "topLevelComment":{
 
                     "snippet":{
 
-                        "textOriginal":text
+                        "textOriginal":texto
 
                     }
 
@@ -209,114 +82,43 @@ def comment(video_id):
     ).execute()
 
 
-
-    return text
-
-
-
-# ==================================================
-# MAIN
-# ==================================================
-
-
-def main():
-
-
-    video=get_latest_video()
-
-
-    if not video:
-
-        print(
-            "Nenhum vídeo encontrado"
-        )
-
-        return
+    return texto
 
 
 
-    database=load_json(
-        DATABASE
+video=novo_video()
+
+
+with open("last_video.txt") as f:
+    antigo=f.read().strip()
+
+
+
+if video != antigo:
+
+
+    comentario=comentar(video)
+
+
+    with open(
+        "last_video.txt",
+        "w"
+    ) as f:
+
+        f.write(video)
+
+
+
+    requests.post(
+        os.environ["DISCORD_WEBHOOK"],
+        json={
+            "content":
+            f"🚀 Novo Xracing!\nComentário: {comentario}"
+        }
     )
 
+else:
 
-
-    if video["id"] in database["videos"]:
-
-        print(
-            "Vídeo já comentado"
-        )
-
-        return
-
-
-
-    try:
-
-
-        comentario = comment(
-            video["id"]
-        )
-
-
-
-        database["videos"].append(
-            video["id"]
-        )
-
-
-        save_json(
-            DATABASE,
-            database
-        )
-
-
-
-        send_discord(
-
-f"""
-🚀 **XRACING DETECTADO**
-
-🎬 {video['title']}
-
-🔗 {video['url']}
-
-💬 Comentário enviado:
-
-"{comentario}"
-
-⏰ {datetime.now()}
-"""
-        )
-
-
-        print(
-            "Comentário enviado"
-        )
-
-
-
-    except Exception as error:
-
-
-        send_discord(
-
-f"""
-❌ ERRO XRACING BOT
-
-{error}
-
-⏰ {datetime.now()}
-"""
-        )
-
-
-        raise error
-
-
-
-
-
-if __name__=="__main__":
-
-    main()
+    print(
+        "Nada novo"
+    )
