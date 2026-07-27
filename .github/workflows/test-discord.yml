@@ -1,0 +1,50 @@
+name: Test Discord Bot
+
+
+on:
+
+  workflow_dispatch:
+
+
+jobs:
+
+  discord-test:
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+      - name: Baixar código
+
+        uses:
+          actions/checkout@v4
+
+
+      - name: Instalar Python
+
+        uses:
+          actions/setup-python@v5
+
+        with:
+
+          python-version: "3.11"
+
+
+      - name: Instalar biblioteca
+
+        run:
+
+          pip install requests
+
+
+      - name: Testar Discord
+
+        env:
+
+          DISCORD_WEBHOOK:
+            ${{ secrets.DISCORD_WEBHOOK }}
+
+        run:
+
+          python teste.py
