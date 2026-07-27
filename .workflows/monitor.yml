@@ -38,7 +38,7 @@ jobs:
       env:
         YOUTUBE_TOKEN: ${{ secrets.YOUTUBE_TOKEN }}
       run: |
-        python main.py
+        python teste_comentario_real.py
 
 
     - name: Save state
