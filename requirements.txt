@@ -1,10 +1,4 @@
-playwright
-beautifulsoup4
-python-dotenv
-requests
-aiohttp
-lxml
-yarl
-brotli
-httpx
-
+feedparser
+google-api-python-client
+google-auth
+google-auth-oauthlib
